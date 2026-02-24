@@ -5,7 +5,7 @@ account: lreyi8-fran0ois-bolduc
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 16731855
-bundleId: 11620445
+bundleId: 11621096
 url: https://lreyi8-fran0ois-bolduc.shinyapps.io/analysersvl/
 version: 1
 asMultiple: FALSE

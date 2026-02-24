@@ -380,6 +380,60 @@ server <- function(input, output, session) {
         .groups = "drop"
       ) %>% arrange(annee_prel)
     
+    # s'assurer que annee_prel est numérique et trié
+    df_summary <- df_summary %>%
+      mutate(annee_prel = as.numeric(annee_prel)) %>%
+      arrange(annee_prel)
+    
+    # enlever doublons éventuels (regrouper si nécessaire)
+    df_summary <- df_summary %>%
+      group_by(annee_prel) %>%
+      summarise(
+        mean_value = mean(mean_value, na.rm = TRUE),
+        ci_low = min(ci_low, na.rm = TRUE),
+        ci_high = max(ci_high, na.rm = TRUE),
+        .groups = "drop"
+      ) %>% arrange(annee_prel)
+    
+    # retirer lignes où ci_low/ci_high sont Inf ou NaN
+    df_summary <- df_summary %>%
+      filter(is.finite(ci_low) & is.finite(ci_high))
+    
+    # Si vous voulez une bande continue même quand certaines années manquent,
+    # reconstruire une séquence d'années et interpoler les valeurs manquantes
+    years_full <- seq(min(df_summary$annee_prel, na.rm = TRUE),
+                      max(df_summary$annee_prel, na.rm = TRUE), by = 1)
+    
+    df_summary_full <- tibble(annee_prel = years_full) %>%
+      left_join(df_summary, by = "annee_prel") %>%
+      arrange(annee_prel)
+    
+    # interpolation linéaire pour mean_value, ci_low, ci_high (remplace NA)
+    if (sum(!is.na(df_summary$mean_value)) >= 2) {
+      df_summary_full$mean_value <- approx(
+        x = df_summary$annee_prel[!is.na(df_summary$mean_value)],
+        y = df_summary$mean_value[!is.na(df_summary$mean_value)],
+        xout = df_summary_full$annee_prel, rule = 2
+      )$y
+      df_summary_full$ci_low <- approx(
+        x = df_summary$annee_prel[!is.na(df_summary$ci_low)],
+        y = df_summary$ci_low[!is.na(df_summary$ci_low)],
+        xout = df_summary_full$annee_prel, rule = 2
+      )$y
+      df_summary_full$ci_high <- approx(
+        x = df_summary$annee_prel[!is.na(df_summary$ci_high)],
+        y = df_summary$ci_high[!is.na(df_summary$ci_high)],
+        xout = df_summary_full$annee_prel, rule = 2
+      )$y
+    } else {
+      # si pas assez de points pour interpoler, on garde df_summary tel quel
+      df_summary_full <- df_summary
+    }
+    
+    # utiliser df_summary_full pour add_ribbons / add_lines
+    df_summary <- df_summary_full
+    
+    
     # Global mean and CI (finite bounds)
     global_mean <- mean(df$yvar, na.rm = TRUE)
     global_sd   <- sd(df$yvar, na.rm = TRUE)
