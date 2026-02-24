@@ -158,7 +158,11 @@ ui <- dashboardPage(
     ),
     
     checkboxInput("show_lm", "Afficher la tendance", value = FALSE),
-    actionButton("update_data", "Mettre à jour la base de données", icon = icon("download"), class = "btn-primary")
+    # Exemple : actionButton pour mise à jour de la base (UI)
+    actionButton("update_data",
+                 label = HTML("Mettre à jour<br>la base de données"),
+                 class = "btn-primary")
+    
   ),
   
   dashboardBody(
@@ -503,22 +507,10 @@ server <- function(input, output, session) {
     subtitle_text <- paste0(scale_label, " (", n_lacs, " lacs, ", n_data, " données)")
     if (isTRUE(input$show_lm) && nzchar(trend_msg)) subtitle_text <- paste(subtitle_text, "|", trend_msg)
     
-    # Start plotly
+    # démarrer le plot
     plt <- plot_ly()
     
-    # Add global CI band as a shape behind traces (layer = "below")
-    plt <- plt %>% layout(
-      shapes = list(
-        list(type = "rect", xref = "x", yref = "y",
-             x0 = rect_x0, x1 = rect_x1, y0 = global_low, y1 = global_high,
-             fillcolor = "#7D3C98", opacity = 0.08, line = list(width = 0),
-             layer = "below")
-      )
-    )
-    
-    # Add either regression layers or annual summary layers (no legend)
-    # --- inside output$timeplot renderPlotly, replace the "mean branch" part with this ---
-    
+    # --- traces régression ou moyenne annuelle ---
     if (isTRUE(input$show_lm) && !is.null(fit_df)) {
       plt <- plt %>%
         add_markers(
@@ -544,7 +536,7 @@ server <- function(input, output, session) {
           showlegend = FALSE
         )
     } else {
-      # If user requested raw points in the plot, add them in blue (#1F618D)
+      # points bruts bleus si demandé
       if (isTRUE(input$show_raw_plot)) {
         plt <- plt %>%
           add_markers(
@@ -553,24 +545,25 @@ server <- function(input, output, session) {
             marker = list(color = "#1F618D", size = 6, opacity = 0.7),
             text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
             hoverinfo = "text",
-            showlegend = FALSE,
-            name = "Données brutes"
+            showlegend = FALSE
           )
       }
       
-      # Annual ribbon + mean line + mean points (unchanged)
+      # CI annuelle (légende) + ligne moyenne (pas dans la légende) + points moyenne (légende)
       plt <- plt %>%
         add_ribbons(
           data = df_summary,
           x = ~annee_prel, ymin = ~ci_low, ymax = ~ci_high,
           fillcolor = "#95A5A6", opacity = 0.3, line = list(width = 0),
+          name = "Intervalles de confiance 95%",
           hoverinfo = "none",
-          showlegend = FALSE
+          showlegend = TRUE
         ) %>%
         add_lines(
           data = df_summary,
           x = ~annee_prel, y = ~mean_value,
           line = list(color = "#2C3E50", width = 2),
+          name = "Moyenne (ligne)",
           hoverinfo = "none",
           showlegend = FALSE
         ) %>%
@@ -580,44 +573,72 @@ server <- function(input, output, session) {
           marker = list(color = "#E74C3C", size = 7),
           text = ~paste0("Année: ", annee_prel, "<br>Moyenne: ", round(mean_value, 3)),
           hoverinfo = "text",
-          showlegend = FALSE
+          name = "Moyenne",
+          showlegend = TRUE
         )
     }
     
-    
-    # Add dotted mean line as a trace (so it is above the rectangle) and two-line label with numeric mean
+    # --- ligne Moyenne globale (trace, mais pas dans la légende) ---
     mean_label_text <- paste0("Moyenne<br>globale: ", round(global_mean, 2))
+    
     plt <- plt %>%
       add_lines(
         x = c(rect_x0, rect_x1),
         y = c(global_mean, global_mean),
         line = list(dash = "dot", color = "#7D3C98", width = 2),
+        name = "Moyenne globale",
         hoverinfo = "none",
         showlegend = FALSE
-      ) %>%
-      layout(
-        annotations = c(plt$x$layout$annotations,
-                        list(
-                          list(x = rect_x1, y = global_mean, xref = "x", yref = "y",
-                               text = mean_label_text,
-                               showarrow = FALSE, xanchor = "left", yanchor = "bottom", font = list(color = "#7D3C98"))
-                        ))
       )
     
-    # Final layout: axes, title, margins; remove legend entirely
-    plt %>%
-      layout(
-        title = list(text = paste0("Évolution - ", var_label), y = 0.95),
-        xaxis = list(title = "Année", range = c(rect_x0, rect_x1)),
-        yaxis = list(title = var_label),
-        hovermode = "closest",
-        margin = list(t = 110, b = 60, l = 80, r = 40),
-        showlegend = FALSE,
-        annotations = c(plt$x$layout$annotations,
-                        list(
-                          list(text = subtitle_text, xref = "paper", x = 0, yref = "paper", y = 1.02, showarrow = FALSE, xanchor = "left")
-                        ))
-      )
+    # --- shapes et annotations (une seule annotation pour la moyenne globale) ---
+    shapes_list <- list(
+      list(type = "rect", xref = "x", yref = "y",
+           x0 = rect_x0, x1 = rect_x1, y0 = global_low, y1 = global_high,
+           fillcolor = "#7D3C98", opacity = 0.08, line = list(width = 0), layer = "below")
+    )
+    
+    annotations_list <- list(
+      list(text = subtitle_text, xref = "paper", x = 0, yref = "paper", y = 1.02, showarrow = FALSE, xanchor = "left"),
+      list(x = rect_x1, y = global_mean, xref = "x", yref = "y",
+           text = mean_label_text, showarrow = FALSE, xanchor = "left", yanchor = "bottom", font = list(color = "#7D3C98"))
+    )
+    
+    # --- layout final (une seule fois) ---
+    plt <- plt %>% layout(
+      shapes = shapes_list,
+      annotations = annotations_list,
+      title = list(text = paste0("Évolution - ", var_label), y = 0.95),
+      xaxis = list(title = "Année", autorange = TRUE),
+      yaxis = list(title = var_label, autorange = TRUE),
+      hovermode = "closest",
+      margin = list(t = 110, b = 120, l = 80, r = 40),
+      showlegend = TRUE,
+      legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.18, yanchor = "top")
+    )
+    
+    plt
+    
+    
+    
+    # --- Construire plt normalement (plot_ly) et ajouter traces/ribbons/markers ---
+    # --- Ne pas réinitialiser plt ici (on a déjà ajouté les traces plus haut) ---
+    # Appliquer layout final en utilisant les listes préparées
+    plt %>% layout(
+      shapes = shapes_list,
+      annotations = annotations_list,
+      title = list(text = paste0("Évolution - ", var_label), y = 0.95),
+      xaxis = list(title = "Année", autorange = TRUE),
+      yaxis = list(title = var_label, autorange = TRUE),
+      hovermode = "closest",
+      margin = list(t = 110, b = 100, l = 80, r = 40),
+      showlegend = TRUE,
+      legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.18, yanchor = "top")
+    )
+    
+    
+    
+    
   })
   
   
