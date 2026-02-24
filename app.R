@@ -397,7 +397,7 @@ server <- function(input, output, session) {
       "Transparence (Secchi)"     = "transp_moy"
     ) == input$variable))
     
-    # Trend message and regression fit if requested (logic inverted per request)
+    # Trend message and regression fit if requested (logic: p<0.05 => significant)
     trend_msg <- ""
     fit_df <- NULL
     if (isTRUE(input$show_lm)) {
@@ -412,7 +412,6 @@ server <- function(input, output, session) {
           input$variable == "transp_moy" ~ "m",
           TRUE ~ ""
         )
-        # Inversion demandée : p < 0.05 => tendance significative, sinon aucune tendance significative
         if (p_value < 0.05) {
           trend_msg <- sprintf("Une tendance significative a été détectée démontrant un changement de %.3f %s par année.", slope, unit)
         } else {
@@ -481,7 +480,18 @@ server <- function(input, output, session) {
           showlegend = FALSE
         )
     } else {
+      # --- NEW: add raw datapoints in blue (same blue as regression) ---
       plt <- plt %>%
+        add_markers(
+          data = df,
+          x = ~annee_prel, y = ~yvar,
+          marker = list(color = "#1F618D", size = 6, opacity = 0.7),
+          text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
+          hoverinfo = "text",
+          showlegend = FALSE,
+          name = "Données brutes"
+        ) %>%
+        # annual ribbon + mean line + mean points
         add_ribbons(
           data = df_summary,
           x = ~annee_prel, ymin = ~ci_low, ymax = ~ci_high,
@@ -506,7 +516,8 @@ server <- function(input, output, session) {
         )
     }
     
-    # Add dotted mean line as a trace (so it is above the rectangle) and two-line label
+    # Add dotted mean line as a trace (so it is above the rectangle) and two-line label with numeric mean
+    mean_label_text <- paste0("Moyenne<br>globale: ", round(global_mean, 2))
     plt <- plt %>%
       add_lines(
         x = c(rect_x0, rect_x1),
@@ -519,7 +530,7 @@ server <- function(input, output, session) {
         annotations = c(plt$x$layout$annotations,
                         list(
                           list(x = rect_x1, y = global_mean, xref = "x", yref = "y",
-                               text = "Moyenne<br>globale",
+                               text = mean_label_text,
                                showarrow = FALSE, xanchor = "left", yanchor = "bottom", font = list(color = "#7D3C98"))
                         ))
       )
@@ -539,6 +550,7 @@ server <- function(input, output, session) {
                         ))
       )
   })
+  
   
   
 }
