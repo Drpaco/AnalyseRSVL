@@ -15,6 +15,7 @@ library(sf)
 library(dplyr)
 library(ggplot2)
 library(stringi)
+library(plotly)
 
 options(encoding = "UTF-8")
 
@@ -161,6 +162,7 @@ ui <- dashboardPage(
   ),
   
   dashboardBody(
+    tabItems(
     tabItem(
       tabName = "timeseries",
       fluidRow(
@@ -185,9 +187,7 @@ ui <- dashboardPage(
             selected = "annee_prel"
           ),
           
-          plotOutput("timeplot", height = "450px",click = "plot_click"),
-          verbatimTextOutput("clicked_lake"),
-          
+          plotlyOutput("timeplot", height = "450px"),
           checkboxInput("show_raw", "Afficher les données brutes", FALSE),
           checkboxInput("show_summary", "Afficher le tableau résumé", FALSE),
           
@@ -206,6 +206,7 @@ ui <- dashboardPage(
         )
       )
     )
+    )
   )
 )
 
@@ -215,27 +216,6 @@ ui <- dashboardPage(
 ##############################################
 
 server <- function(input, output, session) {
-  
-  output$clicked_lake <- renderPrint({
-    req(input$plot_click)
-    
-    df <- donnees_filtrees()
-    
-    # On cherche le point le plus proche du clic
-    near <- nearPoints(
-      df,
-      input$plot_click,
-      xvar = "annee_prel",
-      yvar = input$variable,
-      maxpoints = 1
-    )
-    
-    if (nrow(near) == 0) {
-      return("Aucun point sélectionné")
-    }
-    
-    paste("Lac sélectionné :", near$nom_lac)
-  })
   
   # ---------- 1. Données filtrées ----------
   donnees_filtrees <- reactive({
@@ -371,22 +351,45 @@ server <- function(input, output, session) {
   })
   
   # ---------- 5. Téléchargement CSV ----------
-  output$download_csv <- downloadHandler(
-    filename = function() {
-      paste0("rsvl_resume_", input$scale_level, "_", input$variable, ".csv")
-    },
-    content = function(file) {
-      df <- donnees_filtrees()
-      write.csv(df, file, row.names = FALSE)
-    }
-  )
-  
-  # ---------- 6. Graphique ----------
-  output$timeplot <- renderPlot({
+  output$timeplot <- plotly::renderPlotly({
     df <- donnees_filtrees()
     req(nrow(df) > 0)
     
-    # Label humain de la variable
+    # Ensure numeric x and sorted
+    df <- df %>% mutate(annee_prel = as.numeric(annee_prel)) %>% arrange(annee_prel)
+    df$yvar <- df[[input$variable]]
+    
+    # Summary by year (for mean line + ribbon)
+    df_summary <- df %>%
+      group_by(annee_prel) %>%
+      summarise(
+        mean_value = mean(yvar, na.rm = TRUE),
+        sd_value   = sd(yvar, na.rm = TRUE),
+        n          = sum(!is.na(yvar)),
+        se         = sd_value / sqrt(n),
+        ci_low     = mean_value - 1.96 * se,
+        ci_high    = mean_value + 1.96 * se,
+        .groups = "drop"
+      ) %>% arrange(annee_prel)
+    
+    # Global mean and CI (finite bounds)
+    global_mean <- mean(df$yvar, na.rm = TRUE)
+    global_sd   <- sd(df$yvar, na.rm = TRUE)
+    global_n    <- sum(!is.na(df$yvar))
+    global_se   <- ifelse(global_n > 0, global_sd / sqrt(global_n), NA_real_)
+    global_low  <- global_mean - 1.96 * global_se
+    global_high <- global_mean + 1.96 * global_se
+    
+    x_min <- min(df$annee_prel, na.rm = TRUE)
+    x_max <- max(df$annee_prel, na.rm = TRUE)
+    pad <- ifelse(is.finite(x_min) & is.finite(x_max), max(1, (x_max - x_min) * 0.05), 1)
+    rect_x0 <- x_min - pad
+    rect_x1 <- x_max + pad
+    
+    n_lacs <- n_distinct(df$nom_lac)
+    n_data <- global_n
+    
+    # Human label for variable
     var_label <- names(which(c(
       "Phosphore total"           = "p_tot_moy",
       "Chlorophylle a"            = "chlo_moy",
@@ -394,120 +397,37 @@ server <- function(input, output, session) {
       "Transparence (Secchi)"     = "transp_moy"
     ) == input$variable))
     
-    # Résumé annuel
-    df_summary <- df %>%
-      group_by(annee_prel) %>%
-      summarise(
-        mean_value = mean(.data[[input$variable]], na.rm = TRUE),
-        sd_value   = sd(.data[[input$variable]], na.rm = TRUE),
-        n          = sum(!is.na(.data[[input$variable]])),
-        se         = sd_value / sqrt(n),
-        ci_low     = mean_value - 1.96 * se,
-        ci_high    = mean_value + 1.96 * se
-      )
-    
-    # Moyenne globale
-    global_mean <- mean(df[[input$variable]], na.rm = TRUE)
-    global_sd   <- sd(df[[input$variable]], na.rm = TRUE)
-    global_n    <- sum(!is.na(df[[input$variable]]))
-    global_se   <- global_sd / sqrt(global_n)
-    global_low  <- global_mean - 1.96 * global_se
-    global_high <- global_mean + 1.96 * global_se
-    
-    n_lacs <- n_distinct(df$nom_lac)
-    n_data <- global_n
-    
-    p <- ggplot()
-    
-    # Moyennes annuelles
-    if (!input$show_lm) {
-      p <- p +
-        geom_ribbon(
-          data = df_summary,
-          aes(x = annee_prel, ymin = ci_low, ymax = ci_high),
-          fill = "#95A5A6", alpha = 0.3
-        ) +
-        geom_line(
-          data = df_summary,
-          aes(x = annee_prel, y = mean_value),
-          color = "#2C3E50", size = 1
-        ) +
-        geom_point(
-          data = df_summary,
-          aes(x = annee_prel, y = mean_value),
-          color = "#E74C3C", size = 2
+    # Trend message and regression fit if requested (logic inverted per request)
+    trend_msg <- ""
+    fit_df <- NULL
+    if (isTRUE(input$show_lm)) {
+      lm_try <- try(lm(yvar ~ annee_prel, data = df), silent = TRUE)
+      if (!inherits(lm_try, "try-error") && length(coef(lm_try)) >= 2) {
+        slope <- coef(lm_try)[2]
+        p_value <- summary(lm_try)$coefficients[2, 4]
+        unit <- dplyr::case_when(
+          input$variable == "p_tot_moy"  ~ "µg/L",
+          input$variable == "chlo_moy"   ~ "µg/L",
+          input$variable == "cod_moy"    ~ "mg/L",
+          input$variable == "transp_moy" ~ "m",
+          TRUE ~ ""
         )
-      
-      trend_msg <- ""
-    }
-    
-    # Régression
-    if (input$show_lm) {
-      lm_model <- lm(df[[input$variable]] ~ df$annee_prel)
-      slope   <- coef(lm_model)[2]
-      p_value <- summary(lm_model)$coefficients[2, 4]
-      
-      unit <- dplyr::case_when(
-        input$variable == "p_tot_moy"  ~ "µg/L",
-        input$variable == "chlo_moy"   ~ "µg/L",
-        input$variable == "cod_moy"    ~ "mg/L",
-        input$variable == "transp_moy" ~ "m",
-        TRUE ~ ""
-      )
-      
-      trend_msg <- if (p_value < 0.05) {
-        sprintf(
-          "Les données montrent une tendance significative avec un changement de %.3f %s par année.",
-          slope, unit
-        )
+        # Inversion demandée : p < 0.05 => tendance significative, sinon aucune tendance significative
+        if (p_value < 0.05) {
+          trend_msg <- sprintf("Une tendance significative a été détectée démontrant un changement de %.3f %s par année.", slope, unit)
+        } else {
+          trend_msg <- "Aucune tendance significative détectée"
+        }
+        # prepare fitted line and CI for plotting
+        newx <- seq(x_min, x_max, length.out = 200)
+        pred <- predict(lm_try, newdata = data.frame(annee_prel = newx), se.fit = TRUE)
+        fit_df <- data.frame(x = newx, y = pred$fit, y_lo = pred$fit - 1.96 * pred$se.fit, y_hi = pred$fit + 1.96 * pred$se.fit)
       } else {
-        "Les données ne démontrent aucune tendance significative."
+        input$show_lm <- FALSE
       }
-      
-      p <- p +
-        geom_point(
-          data = df,
-          aes(x = annee_prel, y = .data[[input$variable]]),
-          color = "#34495E", size = 2, alpha = 0.7
-        ) +
-        geom_smooth(
-          data = df,
-          aes(x = annee_prel, y = .data[[input$variable]]),
-          method = "lm",
-          se = TRUE,
-          color = "#1F618D",
-          fill = "#1F618D",
-          alpha = 0.2
-        )
     }
     
-    # Moyenne globale
-    p <- p +
-      geom_hline(
-        yintercept = global_mean,
-        linetype = "dotted",
-        color = "#7D3C98",
-        size = 1
-      ) +
-      geom_rect(
-        aes(
-          xmin = -Inf, xmax = Inf,
-          ymin = global_low, ymax = global_high
-        ),
-        fill = "#7D3C98", alpha = 0.08
-      ) +
-      annotate(
-        "text",
-        x = max(df_summary$annee_prel),
-        y = global_mean,
-        label = "Moyenne globale",
-        hjust = -0.1,
-        vjust = -0.5,
-        color = "#7D3C98",
-        size = 5
-      )
-    
-    # Label d’échelle
+    # Title and subtitle
     scale_label <- switch(
       input$scale_level,
       "annee_prel" = "Année",
@@ -519,20 +439,108 @@ server <- function(input, output, session) {
       "nom_lac"    = paste("Lac :", input$lac),
       "Groupe"
     )
+    subtitle_text <- paste0(scale_label, " (", n_lacs, " lacs, ", n_data, " données)")
+    if (isTRUE(input$show_lm) && nzchar(trend_msg)) subtitle_text <- paste(subtitle_text, "|", trend_msg)
     
-    p +
-      theme_minimal(base_size = 16) +
-      labs(
-        x = "Année",
-        y = var_label,
-        title = paste("Évolution -", var_label),
-        subtitle = paste0(
-          scale_label,
-          " (", n_lacs, " lacs, ", n_data, " données)",
-          if (input$show_lm) paste(" |", trend_msg) else ""
+    # Start plotly
+    plt <- plot_ly()
+    
+    # Add global CI band as a shape behind traces (layer = "below")
+    plt <- plt %>% layout(
+      shapes = list(
+        list(type = "rect", xref = "x", yref = "y",
+             x0 = rect_x0, x1 = rect_x1, y0 = global_low, y1 = global_high,
+             fillcolor = "#7D3C98", opacity = 0.08, line = list(width = 0),
+             layer = "below")
+      )
+    )
+    
+    # Add either regression layers or annual summary layers (no legend)
+    if (isTRUE(input$show_lm) && !is.null(fit_df)) {
+      plt <- plt %>%
+        add_markers(
+          data = df,
+          x = ~annee_prel, y = ~yvar,
+          marker = list(color = "#34495E", size = 6, opacity = 0.7),
+          text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
+          hoverinfo = "text",
+          showlegend = FALSE
+        ) %>%
+        add_lines(
+          data = fit_df,
+          x = ~x, y = ~y,
+          line = list(color = "#1F618D", width = 2),
+          hoverinfo = "none",
+          showlegend = FALSE
+        ) %>%
+        add_ribbons(
+          data = fit_df,
+          x = ~x, ymin = ~y_lo, ymax = ~y_hi,
+          fillcolor = "#1F618D", opacity = 0.15, line = list(width = 0),
+          hoverinfo = "none",
+          showlegend = FALSE
         )
+    } else {
+      plt <- plt %>%
+        add_ribbons(
+          data = df_summary,
+          x = ~annee_prel, ymin = ~ci_low, ymax = ~ci_high,
+          fillcolor = "#95A5A6", opacity = 0.3, line = list(width = 0),
+          hoverinfo = "none",
+          showlegend = FALSE
+        ) %>%
+        add_lines(
+          data = df_summary,
+          x = ~annee_prel, y = ~mean_value,
+          line = list(color = "#2C3E50", width = 2),
+          hoverinfo = "none",
+          showlegend = FALSE
+        ) %>%
+        add_markers(
+          data = df_summary,
+          x = ~annee_prel, y = ~mean_value,
+          marker = list(color = "#E74C3C", size = 7),
+          text = ~paste0("Année: ", annee_prel, "<br>Moyenne: ", round(mean_value, 3)),
+          hoverinfo = "text",
+          showlegend = FALSE
+        )
+    }
+    
+    # Add dotted mean line as a trace (so it is above the rectangle) and two-line label
+    plt <- plt %>%
+      add_lines(
+        x = c(rect_x0, rect_x1),
+        y = c(global_mean, global_mean),
+        line = list(dash = "dot", color = "#7D3C98", width = 2),
+        hoverinfo = "none",
+        showlegend = FALSE
+      ) %>%
+      layout(
+        annotations = c(plt$x$layout$annotations,
+                        list(
+                          list(x = rect_x1, y = global_mean, xref = "x", yref = "y",
+                               text = "Moyenne<br>globale",
+                               showarrow = FALSE, xanchor = "left", yanchor = "bottom", font = list(color = "#7D3C98"))
+                        ))
+      )
+    
+    # Final layout: axes, title, margins; remove legend entirely
+    plt %>%
+      layout(
+        title = list(text = paste0("Évolution - ", var_label), y = 0.95),
+        xaxis = list(title = "Année", range = c(rect_x0, rect_x1)),
+        yaxis = list(title = var_label),
+        hovermode = "closest",
+        margin = list(t = 110, b = 60, l = 80, r = 40),
+        showlegend = FALSE,
+        annotations = c(plt$x$layout$annotations,
+                        list(
+                          list(text = subtitle_text, xref = "paper", x = 0, yref = "paper", y = 1.02, showarrow = FALSE, xanchor = "left")
+                        ))
       )
   })
+  
+  
 }
 
 
