@@ -187,9 +187,17 @@ ui <- dashboardPage(
             selected = "annee_prel"
           ),
           
+          # inside the box that contains the plotlyOutput
           plotlyOutput("timeplot", height = "450px"),
-          checkboxInput("show_raw", "Afficher les données brutes", FALSE),
-          checkboxInput("show_summary", "Afficher le tableau résumé", FALSE),
+          
+          # Toggle to show raw datapoints inside the plot (new)
+          checkboxInput("show_raw_plot", "Afficher les données brutes dans le graphique", value = FALSE),
+          
+          # Checkbox to show the raw data table (label updated)
+          checkboxInput("show_raw", "Afficher le tableau des données brutes ci-dessous", FALSE),
+          
+          # Checkbox to show the summary table (label updated)
+          checkboxInput("show_summary", "Afficher le tableau résumé ci-dessous", FALSE),
           
           conditionalPanel(
             condition = "input.show_summary == true",
@@ -198,11 +206,11 @@ ui <- dashboardPage(
           
           downloadButton("download_csv", "Télécharger les données"),
           
-          
           conditionalPanel(
             condition = "input.show_raw == true",
             DT::dataTableOutput("raw_table")
           )
+          
         )
       )
     )
@@ -455,6 +463,8 @@ server <- function(input, output, session) {
     )
     
     # Add either regression layers or annual summary layers (no legend)
+    # --- inside output$timeplot renderPlotly, replace the "mean branch" part with this ---
+    
     if (isTRUE(input$show_lm) && !is.null(fit_df)) {
       plt <- plt %>%
         add_markers(
@@ -480,18 +490,22 @@ server <- function(input, output, session) {
           showlegend = FALSE
         )
     } else {
-      # --- NEW: add raw datapoints in blue (same blue as regression) ---
+      # If user requested raw points in the plot, add them in blue (#1F618D)
+      if (isTRUE(input$show_raw_plot)) {
+        plt <- plt %>%
+          add_markers(
+            data = df,
+            x = ~annee_prel, y = ~yvar,
+            marker = list(color = "#1F618D", size = 6, opacity = 0.7),
+            text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
+            hoverinfo = "text",
+            showlegend = FALSE,
+            name = "Données brutes"
+          )
+      }
+      
+      # Annual ribbon + mean line + mean points (unchanged)
       plt <- plt %>%
-        add_markers(
-          data = df,
-          x = ~annee_prel, y = ~yvar,
-          marker = list(color = "#1F618D", size = 6, opacity = 0.7),
-          text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
-          hoverinfo = "text",
-          showlegend = FALSE,
-          name = "Données brutes"
-        ) %>%
-        # annual ribbon + mean line + mean points
         add_ribbons(
           data = df_summary,
           x = ~annee_prel, ymin = ~ci_low, ymax = ~ci_high,
@@ -515,6 +529,7 @@ server <- function(input, output, session) {
           showlegend = FALSE
         )
     }
+    
     
     # Add dotted mean line as a trace (so it is above the rectangle) and two-line label with numeric mean
     mean_label_text <- paste0("Moyenne<br>globale: ", round(global_mean, 2))
