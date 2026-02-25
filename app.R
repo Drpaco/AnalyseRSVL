@@ -131,6 +131,7 @@ choix_bv1  <- sort(unique(rsvl_df$bv_n1))
 choix_bv2  <- sort(unique(rsvl_df$bv_n2))
 
 ui <- dashboardPage(
+  
   dashboardHeader(title = "Analyse RSVL"),
   
   dashboardSidebar(
@@ -176,11 +177,11 @@ ui <- dashboardPage(
           status = "primary",
           solidHeader = TRUE,
           
+          
           selectInput(
             "scale_level",
             "Échelle du sommaire des données :",
             choices = c(
-              "Année" = "annee_prel",
               "Région" = "MUS_NM_REG",
               "MRC" = "MUS_NM_MRC",
               "Municipalité" = "MUS_NM_MUN",
@@ -188,7 +189,7 @@ ui <- dashboardPage(
               "BV2" = "bv_n2",
               "Lac" = "nom_lac"
             ),
-            selected = "annee_prel"
+            selected = "MUS_NM_REG"
           ),
           
           # inside the box that contains the plotlyOutput
@@ -332,6 +333,11 @@ server <- function(input, output, session) {
   safe_min <- function(x) if (all(is.na(x))) NA else min(x, na.rm = TRUE)
   safe_max <- function(x) if (all(is.na(x))) NA else max(x, na.rm = TRUE)
   
+  output$raw_table <- DT::renderDataTable({
+    req(input$show_raw)        # n'affiche que si le toggle est activé
+    donnees_filtrees()         # ou df, selon ton nom d'objet
+  })
+  
   output$summary_table <- DT::renderDataTable({
     df <- donnees_filtrees()
     req(nrow(df) > 0)
@@ -385,33 +391,41 @@ server <- function(input, output, session) {
       return(plot_ly() %>% layout(title = "Aucune donnée annuelle disponible"))
     }
     
-    # interpolation sur la séquence d'années pour bande continue
+    # interpolation sur la séquence d'années pour bande continue (sécurisée)
     years_full <- seq(min(df_summary$annee_prel, na.rm = TRUE),
                       max(df_summary$annee_prel, na.rm = TRUE), by = 1)
+    
     df_summary_full <- tibble(annee_prel = years_full) %>%
       left_join(df_summary, by = "annee_prel") %>%
       arrange(annee_prel)
     
-    if (sum(!is.na(df_summary$mean_value)) >= 2) {
-      df_summary_full$mean_value <- approx(
-        x = df_summary$annee_prel[!is.na(df_summary$mean_value)],
-        y = df_summary$mean_value[!is.na(df_summary$mean_value)],
-        xout = df_summary_full$annee_prel, rule = 2
-      )$y
-      df_summary_full$ci_low <- approx(
-        x = df_summary$annee_prel[!is.na(df_summary$ci_low)],
-        y = df_summary$ci_low[!is.na(df_summary$ci_low)],
-        xout = df_summary_full$annee_prel, rule = 2
-      )$y
-      df_summary_full$ci_high <- approx(
-        x = df_summary$annee_prel[!is.na(df_summary$ci_high)],
-        y = df_summary$ci_high[!is.na(df_summary$ci_high)],
-        xout = df_summary_full$annee_prel, rule = 2
-      )$y
+    # fonction utilitaire sûre pour approx
+    safe_approx <- function(x, y, xout) {
+      if (sum(!is.na(y)) < 2) return(rep(NA_real_, length(xout)))
+      tryCatch(
+        approx(x = x[!is.na(y)], y = y[!is.na(y)], xout = xout, rule = 2)$y,
+        error = function(e) rep(NA_real_, length(xout))
+      )
+    }
+    
+    # nbre de valeurs valides pour mean/ci
+    n_mean <- sum(!is.na(df_summary$mean_value))
+    n_ci_low <- sum(!is.na(df_summary$ci_low))
+    n_ci_high <- sum(!is.na(df_summary$ci_high))
+    
+    if (n_mean >= 2 && n_ci_low >= 2 && n_ci_high >= 2) {
+      df_summary_full$mean_value <- safe_approx(df_summary$annee_prel, df_summary$mean_value, df_summary_full$annee_prel)
+      df_summary_full$ci_low     <- safe_approx(df_summary$annee_prel, df_summary$ci_low, df_summary_full$annee_prel)
+      df_summary_full$ci_high    <- safe_approx(df_summary$annee_prel, df_summary$ci_high, df_summary_full$annee_prel)
+      # si approx a renvoyé que des NA (improbable si >=2), fallback
+      if (all(is.na(df_summary_full$mean_value))) df_summary_full <- df_summary
     } else {
+      # pas assez de points pour interpoler : on garde le résumé annuel tel quel
       df_summary_full <- df_summary
     }
+    
     df_summary <- df_summary_full
+    
     
     # statistiques globales
     global_mean <- mean(df$yvar, na.rm = TRUE)
@@ -582,25 +596,35 @@ server <- function(input, output, session) {
            fillcolor = "#7D3C98", opacity = 0.08, line = list(width = 0), layer = "below")
     )
     
-    # positionnement titre / sous-titre : ajustez si nécessaire
-    title_y    <- 0.99
-    subtitle_y <- 0.96
-    top_margin <- if (isTRUE(input$show_lm) && nzchar(trend_msg)) 160 else 120
+    # Preset recommandé à coller tel quel ou ajuster les valeurs
+    title_y            <- 0.95    # position du titre principal en coords paper
+    subtitle_y         <- 0.945   # position du sous-titre très proche du titre
+    subtitle_yshift    <- -6      # pixels vers le bas pour le sous-titre (évite chevauchement du graphe)
+    top_margin         <- 150     # marge supérieure en pixels pour laisser de la place au titre
+    subtitle_font_size <- 11      # taille police du sous-titre
     
-    annotations_list <- list(
-      list(text = subtitle_text,
-           xref = "paper", x = 0, yref = "paper", y = subtitle_y,
-           showarrow = FALSE, xanchor = "left",
-           font = list(size = 12, color = "#444")),
-      list(x = rect_x1, y = global_mean, xref = "x", yref = "y",
-           text = mean_label_text, showarrow = FALSE, xanchor = "left", yanchor = "bottom",
-           font = list(color = "#7D3C98"))
-    )
-    
-    # titre principal (sans trend_msg)
+    # construire le texte du titre et du sous-titre (subtitle_text doit déjà exister)
     title_text <- paste0("Évolution - ", var_label)
     
-    # layout final (une seule fois)
+    # annotations : sous-titre en paper coords avec yshift, + étiquette moyenne globale
+    annotations_list <- list(
+      list(
+        text = subtitle_text,
+        xref = "paper", x = 0,
+        yref = "paper", y = subtitle_y,
+        showarrow = FALSE, xanchor = "left",
+        yanchor = "top",
+        yshift = subtitle_yshift,
+        font = list(size = subtitle_font_size, color = "#444")
+      ),
+      list(
+        x = rect_x1, y = global_mean, xref = "x", yref = "y",
+        text = mean_label_text, showarrow = FALSE, xanchor = "left", yanchor = "bottom",
+        font = list(color = "#7D3C98")
+      )
+    )
+    
+    # layout final
     plt <- plt %>% layout(
       shapes = shapes_list,
       annotations = annotations_list,
@@ -612,6 +636,46 @@ server <- function(input, output, session) {
       showlegend = TRUE,
       legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.18, yanchor = "top")
     )
+    
+    # --- Restore main title + compact spacing ---
+    title_text <- paste0("Évolution - ", var_label)
+    
+    # positions
+    title_y            <- 0.97     # main title safely below modebar
+    subtitle_y         <- 0.955    # subtitle just under the title
+    subtitle_yshift    <- -4       # tiny downward nudge
+    top_margin         <- 90       # compact top margin
+    subtitle_font_size <- 11
+    
+    # --- Forcer un layout compact (coller le sous-titre au haut) ---
+    p_built <- plotly::plotly_build(plt)
+    
+    # marge compacte
+    p_built$x$layout$margin <- list(t = 90, b = 120, l = 80, r = 40)
+    
+    # titre principal
+    p_built$x$layout$title <- list(
+      text = title_text,
+      y = 0.97,
+      pad = list(b = 2)
+    )
+    
+    # repositionner le sous-titre
+    anns <- p_built$x$layout$annotations
+    if (!is.null(anns) && length(anns) >= 1) {
+      anns[[1]]$xref <- "paper"; anns[[1]]$x <- 0
+      anns[[1]]$yref <- "paper"; anns[[1]]$y <- 0.955
+      anns[[1]]$yanchor <- "top"
+      anns[[1]]$yshift <- -4
+      anns[[1]]$font$size <- 11
+    }
+    p_built$x$layout$annotations <- anns
+    
+    plt <- plotly::as_widget(p_built)
+    
+    
+    
+    
     
     plt
   })
