@@ -16,6 +16,8 @@ library(dplyr)
 library(ggplot2)
 library(stringi)
 library(plotly)
+library(nlme)
+library(mgcv)
 
 options(encoding = "UTF-8")
 
@@ -158,7 +160,8 @@ ui <- dashboardPage(
       )
     ),
     
-    checkboxInput("show_lm", "Afficher la tendance", value = FALSE),
+    checkboxInput("show_lm", "Afficher la tendance linéaire", value = FALSE),
+    checkboxInput("show_nl", "Afficher la tendance non-linéaire", value = FALSE),
     # Exemple : actionButton pour mise à jour de la base (UI)
     actionButton("update_data",
                  label = HTML("Mettre à jour<br>la base de données"),
@@ -229,6 +232,18 @@ ui <- dashboardPage(
 ##############################################
 
 server <- function(input, output, session) {
+  
+  observeEvent(input$show_lm, {
+    if (isTRUE(input$show_lm)) {
+      updateCheckboxInput(session, "show_nl", value = FALSE)
+    }
+  })
+  
+  observeEvent(input$show_nl, {
+    if (isTRUE(input$show_nl)) {
+      updateCheckboxInput(session, "show_lm", value = FALSE)
+    }
+  })
   
   # ---------- 1. Données filtrées ----------
   donnees_filtrees <- reactive({
@@ -486,6 +501,15 @@ server <- function(input, output, session) {
       
       # --- nettoyer ---
       df_clean <- df[complete.cases(df$logY, df$annee_prel, df[[lac_var]]), ]
+      df_clean <- droplevels(df_clean)
+      df_clean[[lac_var]] <- factor(df_clean[[lac_var]])
+      
+      if (nrow(df_clean) == 0 || length(unique(df_clean[[lac_var]])) == 0) {
+        trend_msg <- "Aucun lac valide après filtrage — impossible d'ajuster un modèle non linéaire."
+        fit_df <- NULL
+        return(NULL)
+      }
+      
       if (nrow(df_clean) < 3) {
         trend_msg <- "Pas assez de données pour ajuster un modèle."
         return(NULL)
@@ -493,6 +517,14 @@ server <- function(input, output, session) {
       
       # --- nombre de lacs ---
       n_lacs <- length(unique(df_clean[[lac_var]]))
+      
+      unit_label <- dplyr::case_when(
+        input$variable == "p_tot_moy"  ~ "µg/L",
+        input$variable == "chlo_moy"   ~ "µg/L",
+        input$variable == "cod_moy"    ~ "mg/L",
+        input$variable == "transp_moy" ~ "m",
+        TRUE ~ ""
+      )
       
       # --- modèle linéaire ---
       if (isTRUE(input$show_lm) && !isTRUE(input$show_nl)) {
@@ -526,18 +558,17 @@ server <- function(input, output, session) {
         mean_y <- mean(df_clean[[input$variable]], na.rm = TRUE)
         slope_original <- (exp(slope_log) - 1) * mean_y
         
-        unit <- dplyr::case_when(
-          input$variable == "p_tot_moy"  ~ "µg/L",
-          input$variable == "chlo_moy"   ~ "µg/L",
-          input$variable == "cod_moy"    ~ "mg/L",
-          input$variable == "transp_moy" ~ "m",
-          TRUE ~ ""
-        )
-        
-        trend_msg <- if (p_value < 0.05) {
-          sprintf("Tendance significative : changement de %.3f %s par année.", slope_original, unit)
+        # message LM
+        if (p_value < 0.05) {
+          trend_msg <- sprintf(
+            "Tendance linéaire significative : pente %.3f %s/an.",
+            slope_original, unit_label
+          )
         } else {
-          "Aucune tendance significative détectée"
+          trend_msg <- sprintf(
+            "Pente %.3f %s/an (non significative).",
+            slope_original, unit_label
+          )
         }
         
         # prédictions
@@ -558,30 +589,57 @@ server <- function(input, output, session) {
         fit_df <- data.frame(x = newx, y = fit, y_lo = lo, y_hi = hi)
       }
       
+      
+      
+      #unit_label <- unit   # si tu avais déjà une variable 'unit'
+      
       # --- modèle non linéaire (GAM) ---
       if (isTRUE(input$show_nl) && !isTRUE(input$show_lm)) {
         
-        if (n_lacs == 1) {
-          gam_try <- try(
-            mgcv::gam(logY ~ s(annee_prel, k = 10), data = df_clean),
-            silent = TRUE
-          )
-        } else {
-          gam_try <- try(
-            mgcv::gam(logY ~ s(annee_prel, k = 10) + s(df_clean[[lac_var]], bs = "re"), data = df_clean),
-            silent = TRUE
-          )
-        }
+        message("DEBUG: fitting GAM non-linéaire...")
         
-        if (inherits(gam_try, "try-error")) {
-          trend_msg <- paste("Erreur GAM:", attr(gam_try, "condition")$message)
+        df_clean <- df[complete.cases(df$logY, df$annee_prel, df[[lac_var]]), ]
+        df_clean <- droplevels(df_clean)
+        df_clean[[lac_var]] <- factor(df_clean[[lac_var]])
+        
+        if (nrow(df_clean) == 0 || length(unique(df_clean[[lac_var]])) == 0) {
+          trend_msg <- "Aucun lac valide après filtrage — impossible d'ajuster un modèle non linéaire."
+          fit_df <- NULL
           return(NULL)
         }
         
-        trend_msg <- "Modèle non linéaire ajusté (GAM)."
+        n_unique_years <- length(unique(df_clean$annee_prel))
+        k_auto <- max(3, min(10, n_unique_years - 1))
+        
+        if (n_lacs == 1) {
+          gam_formula <- reformulate(
+            response = "logY",
+            termlabels = paste0("s(annee_prel, k=", k_auto, ")")
+          )
+        } else {
+          gam_formula <- as.formula(
+            paste0(
+              "logY ~ s(annee_prel, k=", k_auto, ") + s(",
+              lac_var,
+              ", bs='re')"
+            )
+          )
+        }
+        
+        gam_try <- try(
+          mgcv::gam(gam_formula, data = df_clean, method = "REML"),
+          silent = TRUE
+        )
+        
+        if (inherits(gam_try, "try-error")) {
+          trend_msg <- paste("Erreur GAM:", attr(gam_try, "condition")$message)
+          fit_df <- NULL
+          return(NULL)
+        }
         
         newx <- seq(x_min, x_max, length.out = 200)
         newdata <- data.frame(annee_prel = newx)
+        if (n_lacs > 1) newdata[[lac_var]] <- rep(unique(df_clean[[lac_var]])[1], length(newx))
         
         pred <- predict(gam_try, newdata = newdata, se.fit = TRUE)
         
@@ -590,7 +648,39 @@ server <- function(input, output, session) {
         hi  <- exp(pred$fit + 1.96 * pred$se.fit)
         
         fit_df <- data.frame(x = newx, y = fit, y_lo = lo, y_hi = hi)
+        
+        # pente locale
+        dx <- diff(fit_df$x)
+        dy <- diff(fit_df$y)
+        local_slopes <- dy / dx
+        
+        slope_mean <- mean(local_slopes, na.rm = TRUE)
+        
+        se <- pred$se.fit
+        se_mid <- se[-1]
+        var_local <- (se_mid^2 + se[-length(se)]^2) / (dx^2)
+        se_slope_mean <- sqrt(mean(var_local, na.rm = TRUE))
+        
+        significant <- abs(slope_mean) > 1.96 * se_slope_mean
+        
+        if (significant) {
+          trend_msg <- sprintf(
+            "Tendance non linéaire significative : pente moyenne %.3f %s/an.",
+            slope_mean, unit_label
+          )
+        } else {
+          trend_msg <- sprintf(
+            "Pente moyenne %.3f %s/an (non significative).",
+            slope_mean, unit_label
+          )
+        }
       }
+      
+      
+      
+      
+      
+      
     }
     
     
@@ -616,15 +706,23 @@ server <- function(input, output, session) {
     if (is.null(scale_label) || !nzchar(scale_label)) scale_label <- "Niveau"
     
     subtitle_text <- paste0(scale_label, " (", n_lacs, " lacs, ", n_data, " données)")
-    if (isTRUE(input$show_lm) && nzchar(trend_msg)) {
-      subtitle_text <- paste0(subtitle_text, "<br><span style='font-size:12px;color:#444;'>", trend_msg, "</span>")
+    if ((isTRUE(input$show_lm) || isTRUE(input$show_nl)) && nzchar(trend_msg)) {
+      subtitle_text <- paste0(
+        subtitle_text,
+        "<br><span style='font-size:12px;color:#444;'>",
+        trend_msg,
+        "</span>"
+      )
     }
+    
     
     # démarrer plotly (initialisation obligatoire)
     plt <- plot_ly()
     
     # ajouter traces : régression ou points bruts + bande CI annuelle + moyenne annuelle
+    # --- BRANCHE MODÈLE LINÉAIRE ---
     if (isTRUE(input$show_lm) && !is.null(fit_df)) {
+      
       plt <- plt %>%
         add_markers(
           data = df,
@@ -648,6 +746,35 @@ server <- function(input, output, session) {
           hoverinfo = "none",
           showlegend = FALSE
         )
+      
+      # --- BRANCHE MODÈLE NON-LINÉAIRE (GAM) ---
+    } else if (isTRUE(input$show_nl) && !is.null(fit_df)) {
+      
+      plt <- plt %>%
+        add_markers(
+          data = df,
+          x = ~annee_prel, y = ~yvar,
+          marker = list(color = "#34495E", size = 6, opacity = 0.7),
+          text = ~paste0("Lac: ", nom_lac, "<br>Année: ", annee_prel, "<br>Valeur: ", round(yvar, 3)),
+          hoverinfo = "text",
+          showlegend = FALSE
+        ) %>%
+        add_lines(
+          data = fit_df,
+          x = ~x, y = ~y,
+          line = list(color = "#27AE60", width = 3),   # vert GAM
+          hoverinfo = "none",
+          showlegend = FALSE
+        ) %>%
+        add_ribbons(
+          data = fit_df,
+          x = ~x, ymin = ~y_lo, ymax = ~y_hi,
+          fillcolor = "#27AE60", opacity = 0.15, line = list(width = 0),
+          hoverinfo = "none",
+          showlegend = FALSE
+        )
+      
+      # --- BRANCHE SANS MODÈLE (RAW + MOYENNES) ---
     } else {
       if (isTRUE(input$show_raw_plot)) {
         plt <- plt %>%
@@ -688,6 +815,7 @@ server <- function(input, output, session) {
           showlegend = TRUE
         )
     }
+    
     
     # ligne Moyenne globale (trace, pas dans la légende)
     mean_label_text <- paste0("Moyenne<br>globale: ", round(global_mean, 2))
