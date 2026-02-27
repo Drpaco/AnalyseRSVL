@@ -461,14 +461,71 @@ server <- function(input, output, session) {
     ) == input$variable))
     if (length(var_label) == 0) var_label <- input$variable
     
+    
+    
     # régression et message de tendance (calculer AVANT subtitle_text)
     trend_msg <- ""
     fit_df <- NULL
-    if (isTRUE(input$show_lm)) {
-      lm_try <- try(lm(yvar ~ annee_prel, data = df), silent = TRUE)
-      if (!inherits(lm_try, "try-error") && length(coef(lm_try)) >= 2) {
-        slope <- coef(lm_try)[2]
-        p_value <- summary(lm_try)$coefficients[2, 4]
+    
+    if (isTRUE(input$show_lm) || isTRUE(input$show_nl)) {
+      
+      # --- détecter la colonne lac ---
+      lac_cols <- grep("lac", names(df), ignore.case = TRUE, value = TRUE)
+      if (length(lac_cols) != 1) {
+        trend_msg <- "Impossible d'identifier la colonne du lac."
+        return(NULL)
+      }
+      lac_var <- lac_cols[1]
+      
+      # --- préparer la variable ---
+      y <- df[[input$variable]]
+      if (any(y <= 0, na.rm = TRUE)) {
+        y <- y + min(y[y > 0], na.rm = TRUE) * 0.001
+      }
+      df$logY <- log(y)
+      
+      # --- nettoyer ---
+      df_clean <- df[complete.cases(df$logY, df$annee_prel, df[[lac_var]]), ]
+      if (nrow(df_clean) < 3) {
+        trend_msg <- "Pas assez de données pour ajuster un modèle."
+        return(NULL)
+      }
+      
+      # --- nombre de lacs ---
+      n_lacs <- length(unique(df_clean[[lac_var]]))
+      
+      # --- modèle linéaire ---
+      if (isTRUE(input$show_lm) && !isTRUE(input$show_nl)) {
+        
+        if (n_lacs == 1) {
+          df_clean$grp <- 1
+          random_formula <- ~ 1 | grp
+        } else {
+          random_formula <- as.formula(paste("~ 1 |", lac_var))
+        }
+        
+        lme_try <- try(
+          nlme::lme(
+            logY ~ annee_prel,
+            data = df_clean,
+            random = random_formula
+          ),
+          silent = TRUE
+        )
+        
+        if (inherits(lme_try, "try-error")) {
+          trend_msg <- paste("Erreur du modèle:", attr(lme_try, "condition")$message)
+          return(NULL)
+        }
+        
+        # pente log
+        slope_log <- nlme::fixef(lme_try)[["annee_prel"]]
+        p_value   <- summary(lme_try)$tTable["annee_prel", "p-value"]
+        
+        # pente originale
+        mean_y <- mean(df_clean[[input$variable]], na.rm = TRUE)
+        slope_original <- (exp(slope_log) - 1) * mean_y
+        
         unit <- dplyr::case_when(
           input$variable == "p_tot_moy"  ~ "µg/L",
           input$variable == "chlo_moy"   ~ "µg/L",
@@ -476,18 +533,73 @@ server <- function(input, output, session) {
           input$variable == "transp_moy" ~ "m",
           TRUE ~ ""
         )
-        if (p_value < 0.05) {
-          trend_msg <- sprintf("Tendance significative : changement de %.3f %s par année.", slope, unit)
+        
+        trend_msg <- if (p_value < 0.05) {
+          sprintf("Tendance significative : changement de %.3f %s par année.", slope_original, unit)
         } else {
-          trend_msg <- "Aucune tendance significative détectée"
+          "Aucune tendance significative détectée"
         }
+        
+        # prédictions
         newx <- seq(x_min, x_max, length.out = 200)
-        pred <- predict(lm_try, newdata = data.frame(annee_prel = newx), se.fit = TRUE)
-        fit_df <- data.frame(x = newx, y = pred$fit, y_lo = pred$fit - 1.96 * pred$se.fit, y_hi = pred$fit + 1.96 * pred$se.fit)
-      } else {
-        fit_df <- NULL
+        newdata <- data.frame(annee_prel = newx)
+        if (n_lacs == 1) newdata$grp <- 1 else newdata[[lac_var]] <- df_clean[[lac_var]][1]
+        
+        pred_log <- predict(lme_try, newdata = newdata, level = 0)
+        
+        X <- model.matrix(~ annee_prel, data = newdata)
+        V <- vcov(lme_try)
+        se_log <- sqrt(diag(X %*% V %*% t(X)))
+        
+        fit <- exp(pred_log)
+        lo  <- exp(pred_log - 1.96 * se_log)
+        hi  <- exp(pred_log + 1.96 * se_log)
+        
+        fit_df <- data.frame(x = newx, y = fit, y_lo = lo, y_hi = hi)
+      }
+      
+      # --- modèle non linéaire (GAM) ---
+      if (isTRUE(input$show_nl) && !isTRUE(input$show_lm)) {
+        
+        if (n_lacs == 1) {
+          gam_try <- try(
+            mgcv::gam(logY ~ s(annee_prel, k = 10), data = df_clean),
+            silent = TRUE
+          )
+        } else {
+          gam_try <- try(
+            mgcv::gam(logY ~ s(annee_prel, k = 10) + s(df_clean[[lac_var]], bs = "re"), data = df_clean),
+            silent = TRUE
+          )
+        }
+        
+        if (inherits(gam_try, "try-error")) {
+          trend_msg <- paste("Erreur GAM:", attr(gam_try, "condition")$message)
+          return(NULL)
+        }
+        
+        trend_msg <- "Modèle non linéaire ajusté (GAM)."
+        
+        newx <- seq(x_min, x_max, length.out = 200)
+        newdata <- data.frame(annee_prel = newx)
+        
+        pred <- predict(gam_try, newdata = newdata, se.fit = TRUE)
+        
+        fit <- exp(pred$fit)
+        lo  <- exp(pred$fit - 1.96 * pred$se.fit)
+        hi  <- exp(pred$fit + 1.96 * pred$se.fit)
+        
+        fit_df <- data.frame(x = newx, y = fit, y_lo = lo, y_hi = hi)
       }
     }
+    
+    
+    
+    
+    
+    
+    
+    
     
     # construire le sous-titre : libellé + compteurs ; trend_msg sur 2e ligne si présent
     scale_label <- switch(
